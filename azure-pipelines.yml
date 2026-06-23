@@ -1,0 +1,115 @@
+trigger:
+  branches:
+    include:
+      - main
+  paths:
+    include:
+      - sbg-tools-cloudforge-deployment/cloudformation-deployer/*
+
+parameters:
+- name: IMAGE_TAG
+  displayName: 'Docker Image Tag e.g: PROD-1.0.0'
+  type: string
+  #below parameters are required for CRQ Automation
+- name: RTE_EMAIL
+  displayName: 'RTE (Release Train Engineer) Email'
+  type: string
+- name: TEAM_EMAIL
+  displayName: 'Team Email for Approval Notification'
+  type: string
+- name: CRQ_DESCRIPTION
+  displayName: 'a brief description of what the crq is about'
+  type: string
+- name: CRQ_DETAILS
+  displayName: 'more about what is to be done'
+  type: string
+- name: AWS_ACCOUNT_id
+  displayName: 'Enter AWS Account ID'
+  type: string
+  default: '573185292006'
+
+
+
+
+variables:
+- name: AWS_ACCOUNT_ID
+  value: '573185292006'
+- name: AWS_REGION
+  value: 'af-south-1'
+- name: ECR_REPOSITORY
+  value: 'cloudforge/cloudforge'
+- name: IMAGE_TAG
+  value: ${{ parameters.IMAGE_TAG }}
+
+
+pool: Ubuntu-Agent-Pool-Prod
+
+stages:
+- stage: Build
+  displayName: 'CRQ Remedy and Docker Builds'
+  jobs:
+  - job: BuildPush
+    displayName: 'Build Docker Image and Push to ECR'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+    - task: AWSShellScript@1
+      displayName: 'Configure AWS CLI and ECR Login'
+      inputs:
+        awsCredentials: 'azure_aws_connection_tools'
+        regionName: '$(AWS_REGION)'
+        scriptType: 'inline'
+        inlineScript: |
+          mkdir -p $(Build.ArtifactStagingDirectory)/build-logs
+
+          # Get ECR login token
+          aws ecr get-login-password --region $(AWS_REGION) | docker login --username AWS --password-stdin $(AWS_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com 2>&1 | tee $(Build.ArtifactStagingDirectory)/build-logs/01-ecr-login.log
+          
+          # Create ECR repository if it doesn't exist
+          aws ecr describe-repositories --repository-names $(ECR_REPOSITORY) --region $(AWS_REGION) || \
+          aws ecr create-repository --repository-name $(ECR_REPOSITORY) --region $(AWS_REGION) 2>&1 | tee $(Build.ArtifactStagingDirectory)/build-logs/02-ecr-repo.log
+
+    - task: checkmarx.checkmarx-ast-azure-plugin.cx-scan-task.Checkmarx AST@3
+      displayName: 'Checkmarx AST'
+      inputs:
+        CheckmarxService: 'Checkmarx One - SBG DevOps'
+        tenantName: Standardbank
+
+    - script: |
+        mkdir -p ~/.docker/cli-plugins
+        BUILDX_URL=$(curl -s https://api.github.com/repos/docker/buildx/releases/latest | grep "browser_download_url.*linux-amd64" | head -1 | cut -d '"' -f 4)
+        curl -sSL "$BUILDX_URL" -o ~/.docker/cli-plugins/docker-buildx
+        chmod +x ~/.docker/cli-plugins/docker-buildx
+        docker buildx version 2>&1 | tee $(Build.ArtifactStagingDirectory)/build-logs/03-docker.log
+        docker buildx create --use --name multiarch
+        docker buildx inspect --bootstrap
+      displayName: 'Setup Docker Buildx'
+
+    - script: |
+        docker buildx build --platform linux/amd64,linux/arm64 -f $(Build.SourcesDirectory)/cloudformation-deployer/Dockerfile -t $(AWS_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com/$(ECR_REPOSITORY):$(IMAGE_TAG) --push $(Build.SourcesDirectory)/cloudformation-deployer 2>&1 | tee $(Build.ArtifactStagingDirectory)/build-logs/04-docker.log
+      displayName: 'Build and Push Multi-Platform Docker Image'
+
+    - script: |
+        echo "Multi-platform image pushed successfully:" 2>&1 | tee $(Build.ArtifactStagingDirectory)/build-logs/05-image-uri.log
+        echo "$(AWS_ACCOUNT_ID).dkr.ecr.$(AWS_REGION).amazonaws.com/$(ECR_REPOSITORY):$(IMAGE_TAG)" 2>&1 | tee -a $(Build.ArtifactStagingDirectory)/build-logs/05-image-uri.log
+      displayName: 'Output Image URI'
+
+    - task: PublishPipelineArtifact@1
+      displayName: 'Publish Build Logs'
+      inputs:
+        targetPath: '$(Build.ArtifactStagingDirectory)/build-logs'
+        artifactName: 'build-logs'
+  
+- stage: CRQ
+  displayName: 'CRQ Remedy Integration'
+  dependsOn: Build
+  jobs:
+  - template: crq-auto.yml
+    parameters:
+      RTE_EMAIL: ${{ parameters.RTE_EMAIL }}
+      TEAM_EMAIL: ${{ parameters.TEAM_EMAIL }}
+      CRQ_DESCRIPTION: ${{ parameters.CRQ_DESCRIPTION }}
+      CRQ_DETAILS: ${{ parameters.CRQ_DETAILS }}
+      AWS_ACCOUNT_id: ${{ parameters.AWS_ACCOUNT_id }}
+      AWS_REGION: 'af-south-1'
+      POOL_NAME: 'Ubuntu-Agent-Pool-Prod'
